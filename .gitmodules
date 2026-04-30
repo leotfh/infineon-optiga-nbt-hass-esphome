@@ -1,0 +1,9 @@
+[submodule "android"]
+	path = android
+	url = https://github.com/leotfh/optiga-nbt-example-challenge-response-android
+[submodule "firmware/optiga-nbt-esphome"]
+	path = firmware/optiga-nbt-esphome
+	url = https://github.com/leotfh/optiga-nbt-esphome
+[submodule "firmware/nbt-auth"]
+	path = firmware/nbt-auth
+	url = https://github.com/leotfh/nbt_auth

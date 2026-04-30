@@ -1,0 +1,317 @@
+esphome:
+  name: "esp32c3-nbt"
+  friendly_name: "NBT Shield Test"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+ota:
+  - platform: esphome
+  - platform: web_server
+
+wifi:
+  ssid: !secret idn_wifi_ssid
+  password: !secret idn_wifi_password
+  domain: .grz.infineon.com
+
+web_server:
+  port: 443
+  version: 3
+  auth:
+    username: !secret device_name_web_username
+    password: !secret device_name_web_password
+
+i2c:
+  - id: bus_a
+    sda: GPIO8
+    scl: GPIO9
+    frequency: 400kHz
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: rgb_led
+    name: "RGB LED"
+    rgb_order: GRB
+    pin: GPIO48
+    num_leds: 1
+    chipset: ws2812
+    restore_mode: ALWAYS_OFF
+    effects:
+      - strobe:
+          name: "Auth Success"
+          colors:
+            - state: true
+              brightness: 100%
+              red: 0%
+              green: 100%
+              blue: 0%
+              duration: 200ms
+            - state: false
+              duration: 200ms
+      - strobe:
+          name: "Auth Failed"
+          colors:
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 0%
+              blue: 0%
+              duration: 100ms
+            - state: false
+              duration: 100ms
+
+api:
+  encryption:
+    key: !secret esp32c3_api_key
+  homeassistant_services: true
+  actions:
+    - action: enroll_phone
+      variables:
+        name: string
+        device_id: string
+        public_key: string
+      then:
+        - lambda: |-
+            bool ok = id(nbt_auth_component)->enroll_phone(name, device_id, public_key, true);
+            ESP_LOGI("main", "enroll_phone(%s) -> %s", device_id.c_str(), ok ? "OK" : "FAIL");
+    - action: revoke_phone
+      variables:
+        device_id: string
+      then:
+        - lambda: |-
+            bool ok = id(nbt_auth_component)->revoke_phone(device_id);
+            ESP_LOGI("main", "revoke_phone(%s) -> %s", device_id.c_str(), ok ? "OK" : "FAIL");
+    - action: wipe_all_phones
+      then:
+        - lambda: |-
+            size_t n = id(nbt_auth_component)->wipe_all_phones();
+            ESP_LOGW("main", "wipe_all_phones erased %u entries", (unsigned) n);
+
+globals:
+  - id: auth_challenge_armed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: auth_verdict_pending
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+script:
+  - id: arm_challenge_script
+    mode: single
+    then:
+      - lambda: |-
+          id(auth_challenge_armed) = false;
+          id(auth_verdict_pending) = false;
+          id(nbt_auth_component)->arm_challenge();
+          std::string challenge = id(nbt_auth_component)->get_current_challenge();
+          std::string uri = "nbtauth://challenge/" + challenge;
+          if (id(nbt)->write_ndef_t4t(uri)) {
+            id(auth_challenge_armed) = true;
+            ESP_LOGI("main", "✓ Challenge armed: %s", uri.c_str());
+          } else {
+            ESP_LOGE("main", "✗ write_ndef_t4t failed — chip not ready?");
+          }
+
+# Load external components
+external_components:
+  - source:
+      type: local
+      path: my_components
+    components: [ optiga_nbt, nbt_auth ]
+
+optiga_nbt:
+  id: nbt
+  name: "NFC Field Detected"
+  interrupt_pin: GPIO1
+  # C031=0x01 → chip drives IRQ LOW-active. Invert so LOW reads as "active".
+  invert_interrupt_pin: true
+  i2c_id: bus_a
+  # NDEF ADT MODE (C030=0x02, C034=0x01).
+  # The chip handles T4T NDEF autonomously during an NFC tap. The IRQ pin
+  # signals field presence/absence only.  The ESP writes the challenge NDEF
+  # via I2C before the tap and reads the response NDEF after field release.
+  # Run "Configure NBT NDEF Mode" + "NBT Software Reset" once to activate.
+  field_detect_debounce: 100
+  on_field_detect:
+    then:
+      - lambda: |-
+          if (!id(auth_challenge_armed)) {
+            ESP_LOGD("main", "Field detected — no challenge armed");
+          } else {
+            ESP_LOGI("main", "Field detected — waiting for phone to complete auth…");
+          }
+  on_field_release:
+    then:
+      - lambda: |-
+          // Verdict tap just ended → auto-arm a fresh challenge for the
+          // next authentication attempt. Skip the response-read path
+          // because the NDEF currently holds our verdict, not a response.
+          if (id(auth_verdict_pending)) {
+            id(auth_verdict_pending) = false;
+            ESP_LOGI("main", "Verdict consumed — auto-arming next challenge");
+            id(arm_challenge_script).execute();
+            return;
+          }
+          if (!id(auth_challenge_armed)) {
+            ESP_LOGD("main", "Field released — no challenge was armed, skipping read");
+            return;
+          }
+          ESP_LOGI("main", "Field released — reading response NDEF…");
+          id(nbt)->read_and_dispatch_response();
+  on_ndef_update:
+    then:
+      - lambda: |-
+          // x is the response URI captured from the phone's PUT RESPONSE APDU.
+          ESP_LOGI("main", "Response URI: %s", x.c_str());
+
+          static const std::string PREFIX = "nbtauth://response/";
+          if (x.compare(0, PREFIX.size(), PREFIX) != 0) {
+            ESP_LOGW("main", "Response URI missing prefix: %s", x.c_str());
+            return;
+          }
+          std::string data = x.substr(PREFIX.size());
+          size_t comma = data.find(',');
+          if (comma == std::string::npos) {
+            ESP_LOGW("main", "Response URI missing comma: %s", x.c_str());
+            return;
+          }
+          std::string device_id = data.substr(0, comma);
+          std::string signature = data.substr(comma + 1);
+
+          // Consume the challenge regardless of outcome to prevent replay.
+          id(auth_challenge_armed) = false;
+
+          ESP_LOGI("main", "Device: %s — verifying…", device_id.c_str());
+          bool ok = id(nbt_auth_component)->verify_and_unlock(device_id, signature);
+          if (ok) {
+            ESP_LOGI("main", "✓ ACCESS GRANTED for %s", device_id.c_str());
+          } else {
+            ESP_LOGW("main", "✗ ACCESS DENIED for %s", device_id.c_str());
+          }
+
+          // Write a verdict NDEF so the phone can read the real outcome on
+          // the next tap. Field is released here so I2C access is allowed.
+          std::string verdict = std::string("nbtauth://verdict/")
+                              + (ok ? "granted/" : "denied/")
+                              + device_id;
+          if (id(nbt)->write_ndef_t4t(verdict)) {
+            id(auth_verdict_pending) = true;
+            ESP_LOGI("main", "Verdict armed: %s", verdict.c_str());
+          } else {
+            ESP_LOGE("main", "Failed to write verdict NDEF — auto-arming new challenge");
+            id(arm_challenge_script).execute();
+          }
+          // After the phone reads the verdict, on_field_release auto-arms
+          // a fresh challenge for the next authentication attempt.
+
+# Door lock
+switch:
+  - platform: gpio
+    pin: GPIO5
+    name: "Door Lock"
+    id: door_lock
+    icon: "mdi:door"
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - delay: 5s
+      - switch.turn_off: door_lock
+
+# NBT Authentication component
+nbt_auth:
+  id: nbt_auth_component
+  door_lock: door_lock
+  status_led: rgb_led
+  
+  # Add authorized phones here (from Android enrollment QR codes)
+  authorized_phones:
+    - name: !secret phone1_name
+      device_id: !secret phone1_device_id
+      public_key: !secret phone1_public_key
+      enabled: true
+
+button:
+  - platform: template
+    name: "Arm Door Unlock Challenge"
+    icon: "mdi:key-wireless"
+    on_press:
+      - script.execute: arm_challenge_script
+
+  - platform: template
+    name: "Configure NBT Pass-Through"
+    icon: "mdi:chip"
+    on_press:
+      - lambda: |-
+          ESP_LOGI("main", "Starting NBT pass-through configuration...");
+          if (id(nbt)->configure_pass_through()) {
+            ESP_LOGI("main", "✓ NBT configured! Run the NBT Software Reset button to activate it.");
+          } else {
+            ESP_LOGE("main", "✗ NBT configuration failed — check I2C wiring and chip state.");
+          }
+
+  - platform: template
+    name: "Manual PT Poll"
+    icon: "mdi:radar"
+    on_press:
+      - lambda: |-
+          // Diagnostic: explicitly drive a PT session without waiting for the
+          // IRQ. Tap the phone, keep it on the antenna, then press this button.
+          // If the ESP shows "PT APDU[0]: CLA=00 INS=A4 …" lines, PT mode itself
+          // works and only the IRQ wiring is broken (we'd then switch to a
+          // polling-based dispatcher). If we still see only "PT: FETCH timeout"
+          // or non-9000 SWs, the chip isn't activating PT for our SELECT.
+          ESP_LOGI("main", "Manual PT poll triggered…");
+          bool ok = id(nbt)->poll_and_handle_apdu();
+          ESP_LOGI("main", "Manual PT poll done (auth_triggered=%s)", ok ? "yes" : "no");
+
+  - platform: template
+    name: "Toggle IRQ Polarity"
+    icon: "mdi:swap-vertical"
+    on_press:
+      - lambda: |-
+          ESP_LOGI("main", "Toggling IRQ polarity (C031)…");
+          id(nbt)->toggle_irq_polarity();
+
+  - platform: template
+    name: "Configure NBT NDEF Mode"
+    icon: "mdi:chip"
+    on_press:
+      - lambda: |-
+          ESP_LOGI("main", "Starting NBT NDEF-mode configuration...");
+          if (id(nbt)->configure_ndef_mode()) {
+            ESP_LOGI("main", "✓ NBT NDEF mode configured! Run the NBT Software Reset button to activate it.");
+          } else {
+            ESP_LOGE("main", "✗ NBT NDEF-mode configuration failed.");
+          }
+
+  - platform: template
+    name: "NBT Software Reset"
+    icon: "mdi:restart"
+    on_press:
+      - lambda: |-
+          ESP_LOGI("main", "Triggering NBT software reset...");
+          if (id(nbt)->software_reset()) {
+            ESP_LOGI("main", "✓ NBT software reset complete");
+          } else {
+            ESP_LOGE("main", "✗ NBT software reset failed");
+          }
+
+  - platform: template
+    name: "Dump CC File"
+    icon: "mdi:file-find"
+    on_press:
+      - lambda: |-
+          id(nbt)->dump_cc_file();
+
+  - platform: template
+    name: "Dump NBT Config"
+    icon: "mdi:magnify"
+    on_press:
+      - lambda: |-
+          id(nbt)->dump_chip_config();
