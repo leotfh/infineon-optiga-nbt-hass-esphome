@@ -7,3 +7,6 @@
 [submodule "firmware/nbt-auth"]
 	path = firmware/nbt-auth
 	url = https://github.com/leotfh/nbt_auth
+[submodule "firmware/nbt_improv"]
+	path = firmware/nbt_improv
+	url = https://github.com/leotfh/nbt_improv/
